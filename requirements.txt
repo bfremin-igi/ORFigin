@@ -1,0 +1,11 @@
+torch==2.8.0
+transformers==4.29.2
+scikit-learn==1.2.2
+einops==0.6.1
+peft==0.3.0
+omegaconf==2.3.0
+tqdm==4.66.1
+biopython==1.81
+mmseqs==1.0.0
+
+conda install -c bioconda mafft rnacode seqkit
