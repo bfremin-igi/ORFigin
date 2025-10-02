@@ -39,7 +39,7 @@ python main.py extract $1.scores $1.fa $1_150.fasta 0 150
 #Step 3: Runs ORFigin to assign probability of "Real" vs "Not Real" (requires GPU)
 python main.py inference $1_150.fasta $1_150out
 
-#Step 4: (Optional) - if you give it a list of 150 bp start of genes from Step 2 (ie. $1_150.fasta), it will cluster, align, and build comparative genomics support (only requires CPU)
+#Step 4: (Optional) - given list of starts (ie. $1_150.fasta), clusters -> aligns -> RNAcode
 python comparative_pipeline.py startslist.txt --threads 16 --outdir my_output
 
 
