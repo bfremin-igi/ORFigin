@@ -8,8 +8,8 @@ This repository provides a pipeline for **Prodigal-based ORF prediction** combin
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/yourrepo.git
-cd yourrepo
+git clone https://github.com/bfremin-igi/ORFigin.git
+cd ORFigin
 
 # Create and activate environment
 conda create -n BERT python=3.10 -y
@@ -17,4 +17,23 @@ conda activate BERT
 
 # Install dependencies
 pip install -r requirements.txt
+
+
+## 🚀 Usage
+
+### Example Pipeline Script
+
+`run_pipeline.sh`
+
+```bash
+#!/bin/bash
+conda activate BERT
+
+# Step 1: Run Prodigal to generate ORF scores
+python scripts/main.py prodigal $1.fa $1 meta
+
+# Step 2: Extract candidate ORFs and output truncated FASTA
+python scripts/main.py extract $1.scores $1.fa $1_150.fasta 0 150
+
+
 
