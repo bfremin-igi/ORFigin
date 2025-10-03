@@ -1,4 +1,4 @@
-# 🧬 Comparative ORF Prediction Pipeline
+# 🧬 Emerging ORF Prediction Pipeline
 
 This repository provides a pipeline for **Prodigal-based ORF prediction** combined with a **BERT classifier** for sequence scoring. It includes scripts for inference, utilities, and an end-to-end workflow.
 
