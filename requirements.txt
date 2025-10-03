@@ -7,5 +7,3 @@ omegaconf==2.3.0
 tqdm==4.66.1
 biopython==1.81
 mmseqs==1.0.0
-
-conda install -c bioconda mafft rnacode seqkit
