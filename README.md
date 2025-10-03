@@ -17,6 +17,7 @@ conda activate BERT
 
 # Install dependencies
 pip install -r requirements.txt
+conda install -c bioconda mafft rnacode seqkit
 ```
 
 
