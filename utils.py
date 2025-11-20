@@ -1,148 +1,150 @@
 #!/usr/bin/env python3
-from Bio import SeqIO
-import re
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import csv
 from pathlib import Path
+import sys
+import subprocess
 
-def extract_strong_starts(scores_file, genome_fasta, threshold=0.0, length=150,
-                          output_fasta=None, faa_file=None):
-    """
-    Extract strong start sequences from a Prodigal .scores file, ignoring 'Edge' genes.
-    Also skip any starts that Prodigal already predicted (from .faa file).
+# import utilities
+from utils import extract_strong_starts, deduplicate_by_stop
 
-    Filtering logic:
-      - Parse all ORFs from the .faa file and collect (start,end,strand) per contig.
-      - When scanning the .scores candidates, skip any candidate whose 'Beg' lies
-        within any predicted ORF interval on the same contig (inclusive).
-    """
+# -----------------------------
+# Prodigal wrapper
+# -----------------------------
+def run_prodigal(fasta_file, output_prefix, mode="meta"):
+    output_prefix = Path(output_prefix)
+    ffn_out = output_prefix.with_suffix(".ffn")
+    faa_out = output_prefix.with_suffix(".faa")
+    scores_out = output_prefix.with_suffix(".scores")
 
-    # Load all contigs (seq records keyed by contig id)
-    contigs = {record.id.split()[0]: record.seq for record in SeqIO.parse(genome_fasta, "fasta")}
+    cmd = [
+        "prodigal",
+        "-i", str(fasta_file),
+        "-d", str(ffn_out),
+        "-a", str(faa_out),
+        "-s", str(scores_out),
+        "-p", mode,
+        "-q"
+    ]
+    print(f"Running Prodigal: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    print(f"Prodigal complete. Outputs: {ffn_out}, {faa_out}, {scores_out}")
+    return ffn_out, faa_out, scores_out
 
-    # Parse prodigal .faa to collect predicted ORFs per contig
-    predicted_orfs = {}  # contig -> list of (start, end, strand_int)
-    if faa_file and Path(faa_file).exists():
-        for record in SeqIO.parse(faa_file, "fasta"):
-            desc = record.description
+# -----------------------------
+# DNABERT inference
+# -----------------------------
+def run_dnabert_inference(ffn_file, output_file, device="cuda"):
+    model_dir = Path("model/")  # expects model/ folder with HF model files
 
-            # Try a robust regex to capture "# <start> # <end> # <strand> #"
-            m = re.search(r'#\s*(\d+)\s*#\s*(\d+)\s*#\s*([+-]?\d+)\s*#', desc)
-            if m:
-                start = int(m.group(1))
-                end = int(m.group(2))
-                # strand in .faa is often "-1" or "1"
-                try:
-                    strand_int = int(m.group(3))
-                    if strand_int not in (-1, 1):
-                        strand_int = 1 if strand_int > 0 else -1
-                except ValueError:
-                    strand_int = 1
-            else:
-                # fallback to splitting on "#"
-                parts = desc.split("#")
-                if len(parts) >= 4:
-                    try:
-                        start = int(parts[1].strip())
-                        end = int(parts[2].strip())
-                        strand_field = parts[3].strip()
-                        try:
-                            strand_int = int(strand_field)
-                            if strand_int not in (-1, 1):
-                                strand_int = 1 if strand_int > 0 else -1
-                        except ValueError:
-                            # e.g. '+' or '-'
-                            strand_int = 1 if strand_field.startswith("+") else -1
-                    except Exception:
-                        continue
-                else:
-                    continue
+    print(f"Loading model from {model_dir} ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_dir,
+        trust_remote_code=True
+    )
 
-            # record.id is the protein id like "k119_73647_1" -> derive contig base "k119_73647"
-            prot_id = record.id.split()[0]
-            m2 = re.match(r'^(.+?)_(\d+)$', prot_id)
-            contig_base = m2.group(1) if m2 else prot_id
+    # Force PyTorch attention (disable FlashAttention/Triton)
+    if hasattr(model.config, "use_flash_attn"):
+        model.config.use_flash_attn = False
+    for module in model.modules():
+        if hasattr(module, "flash_attn_forward"):
+            module.flash_attn_forward = None
 
-            predicted_orfs.setdefault(contig_base, []).append((start, end, strand_int))
+    model.to(device)
+    model.eval()
 
-    # Counters / results
-    strong_starts = []
-    filtered_by_prodigal = 0
-    current_contig = None
+    # read sequences from FASTA
+    from Bio import SeqIO
+    fragments = [(record.id, str(record.seq)) for record in SeqIO.parse(ffn_file, "fasta")]
 
-    # Read scores file and extract candidates
-    with open(scores_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("# Sequence Data:"):
-                m = re.search('seqhdr="([^"]+)"', line)
-                if m:
-                    # seqhdr may contain additional info after a space; take first token
-                    current_contig = m.group(1).split()[0]
-                    if current_contig not in contigs:
-                        raise ValueError(f"Contig {current_contig} not found in genome FASTA")
-                continue
-            if line.startswith("#"):
-                continue
+    results = []
+    print(f"Running inference on {len(fragments)} sequences ...")
+    with torch.no_grad():
+        for header, seq in fragments:
+            inputs = tokenizer(seq, return_tensors="pt", padding=True, truncation=True).to(device)
+            logits = model(**inputs).logits
+            prob = torch.softmax(logits, dim=1)[0, 1].item()
+            results.append((header, prob))
 
-            cols = line.split()
-            if len(cols) < 7 or current_contig is None:
-                continue
+    # save results
+    with open(output_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ORF_ID", "Real_probability"])
+        writer.writerows(results)
 
-            try:
-                beg = int(cols[0])
-                end = int(cols[1])
-                strand_field = cols[2]
-                strt_score = float(cols[5])
-                codon = cols[6]
-            except ValueError:
-                continue
+    print(f"Inference complete. Results saved to {output_file}")
 
-            # Skip edge cases
-            if codon == "Edge":
-                continue
+# -----------------------------
+# Main CLI
+# -----------------------------
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python main.py prodigal <input.fasta> <output_prefix> [meta|single]")
+        print("  python main.py extract <scores_file> <genome.fasta> <output.fasta> [threshold] [length]")
+        print("  python main.py inference <input.fasta> <output.csv> [device]")
+        print("  python main.py deduplicate <inference.csv> <scores_file> <output.csv> [weight_start] [weight_inference]")
+        sys.exit(1)
 
-            # convert strand to integer oriented like Prodigal: '+' -> 1, '-' -> -1
-            if strand_field == "+":
-                candidate_strand = 1
-            elif strand_field == "-":
-                candidate_strand = -1
-            else:
-                # sometimes it's numeric (e.g. "1" or "-1")
-                try:
-                    candidate_strand = int(strand_field)
-                except ValueError:
-                    candidate_strand = 1
+    mode = sys.argv[1]
 
-            # If this contig has predicted ORFs, skip if the candidate 'beg' lies within any ORF
-            skip = False
-            for (ps, pe, pstrand) in predicted_orfs.get(current_contig, []):
-                # match same strand OR ignore strand? currently require same strand
-                if candidate_strand == pstrand and (ps <= beg <= pe):
-                    skip = True
-                    break
-            if skip:
-                filtered_by_prodigal += 1
-                continue
+    if mode == "prodigal":
+        if len(sys.argv) < 4:
+            print("Usage: python main.py prodigal <input.fasta> <output_prefix> [meta|single]")
+            sys.exit(1)
+        fasta_file = sys.argv[2]
+        output_prefix = sys.argv[3]
+        prod_mode = sys.argv[4] if len(sys.argv) > 4 else "meta"
+        run_prodigal(fasta_file, output_prefix, prod_mode)
 
-            if strt_score >= threshold:
-                seq_obj = contigs[current_contig]
-                if candidate_strand == 1:
-                    start_idx = max(0, beg - 1)
-                    end_idx = start_idx + length
-                    seq = seq_obj[start_idx:end_idx]
-                else:
-                    # negative strand: take window ending at 'end'
-                    end_idx = min(len(seq_obj), end)
-                    start_idx = max(0, end_idx - length)
-                    seq = seq_obj[start_idx:end_idx].reverse_complement()
-                strong_starts.append((f"{current_contig}_start_{beg}_{end}_{'+' if candidate_strand==1 else '-'}", str(seq)))
+    elif mode == "extract":
+        if len(sys.argv) < 5:
+            print("Usage: python main.py extract <scores_file> <genome.fasta> <output.fasta> [threshold] [length]")
+            sys.exit(1)
+        scores_file = sys.argv[2]
+        genome_fasta = sys.argv[3]
+        output_file = sys.argv[4]
+        threshold = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
+        length = int(sys.argv[6]) if len(sys.argv) > 6 else 150
+        # automatically pick up corresponding .faa file from scores_file prefix
+        faa_file = Path(scores_file).with_suffix(".faa")
+        extract_strong_starts(scores_file, genome_fasta, threshold, length, output_file, faa_file=faa_file)
 
-    if output_fasta:
-        with open(output_fasta, "w") as out:
-            for header, seq in strong_starts:
-                out.write(f">{header}\n{seq}\n")
-        print(f"Extracted {len(strong_starts)} strong start sequences to {output_fasta} "
-              f"(skipped {filtered_by_prodigal} candidates because Prodigal already predicted an ORF here)")
+    elif mode == "inference":
+        if len(sys.argv) < 4:
+            print("Usage: python main.py inference <input.fasta> <output.csv> [device]")
+            sys.exit(1)
+        ffn_file = sys.argv[2]
+        output_file = sys.argv[3]
+        device = sys.argv[4] if len(sys.argv) > 4 else "cuda"
+        run_dnabert_inference(ffn_file, output_file, device)
 
-    return strong_starts
+    elif mode == "deduplicate":
+        if len(sys.argv) < 5:
+            print("Usage: python main.py deduplicate <inference.csv> <scores_file> <output.csv> [weight_start] [weight_inference]")
+            print("\nDeduplicates ORFs that share the same stop codon, keeping the best")
+            print("candidate based on a weighted combination of start score and inference score.")
+            print("\nDefaults: weight_start=0.5, weight_inference=0.5")
+            print("Example: python main.py deduplicate results.csv genome.scores dedup.csv 0.3 0.7")
+            sys.exit(1)
+        inference_csv = sys.argv[2]
+        scores_file = sys.argv[3]
+        output_csv = sys.argv[4]
+        weight_start = float(sys.argv[5]) if len(sys.argv) > 5 else 0.5
+        weight_inference = float(sys.argv[6]) if len(sys.argv) > 6 else 0.5
+        
+        # Validate weights
+        if weight_start < 0 or weight_start > 1 or weight_inference < 0 or weight_inference > 1:
+            print("Error: Weights must be between 0 and 1")
+            sys.exit(1)
+        if abs(weight_start + weight_inference - 1.0) > 0.01:
+            print("Warning: Weights do not sum to 1.0, but proceeding anyway...")
+        
+        deduplicate_by_stop(inference_csv, scores_file, output_csv, weight_start, weight_inference)
+
+    else:
+        print(f"Unknown mode: {mode}")
+        print("\nAvailable modes: prodigal, extract, inference, deduplicate")
+        sys.exit(1)
