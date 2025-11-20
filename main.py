@@ -7,7 +7,7 @@ import sys
 import subprocess
 
 # import utilities
-from utils import extract_strong_starts
+from utils import extract_strong_starts, deduplicate_by_stop
 
 # -----------------------------
 # Prodigal wrapper
@@ -85,6 +85,7 @@ if __name__ == "__main__":
         print("  python main.py prodigal <input.fasta> <output_prefix> [meta|single]")
         print("  python main.py extract <scores_file> <genome.fasta> <output.fasta> [threshold] [length]")
         print("  python main.py inference <input.fasta> <output.csv> [device]")
+        print("  python main.py deduplicate <inference.csv> <scores_file> <output.csv> [weight_start] [weight_inference]")
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -120,6 +121,30 @@ if __name__ == "__main__":
         device = sys.argv[4] if len(sys.argv) > 4 else "cuda"
         run_dnabert_inference(ffn_file, output_file, device)
 
+    elif mode == "deduplicate":
+        if len(sys.argv) < 5:
+            print("Usage: python main.py deduplicate <inference.csv> <scores_file> <output.csv> [weight_start] [weight_inference]")
+            print("\nDeduplicates ORFs that share the same stop codon, keeping the best")
+            print("candidate based on a weighted combination of start score and inference score.")
+            print("\nDefaults: weight_start=0.5, weight_inference=0.5")
+            print("Example: python main.py deduplicate results.csv genome.scores dedup.csv 0.3 0.7")
+            sys.exit(1)
+        inference_csv = sys.argv[2]
+        scores_file = sys.argv[3]
+        output_csv = sys.argv[4]
+        weight_start = float(sys.argv[5]) if len(sys.argv) > 5 else 0.5
+        weight_inference = float(sys.argv[6]) if len(sys.argv) > 6 else 0.5
+        
+        # Validate weights
+        if weight_start < 0 or weight_start > 1 or weight_inference < 0 or weight_inference > 1:
+            print("Error: Weights must be between 0 and 1")
+            sys.exit(1)
+        if abs(weight_start + weight_inference - 1.0) > 0.01:
+            print("Warning: Weights do not sum to 1.0, but proceeding anyway...")
+        
+        deduplicate_by_stop(inference_csv, scores_file, output_csv, weight_start, weight_inference)
+
     else:
         print(f"Unknown mode: {mode}")
+        print("\nAvailable modes: prodigal, extract, inference, deduplicate")
         sys.exit(1)
