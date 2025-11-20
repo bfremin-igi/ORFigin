@@ -160,6 +160,14 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
     stop codon. We want to pick the best one based on both the Prodigal start score
     and the DNABERT inference score.
     
+    IMPORTANT: Prodigal coordinates are always in genomic order (lower first):
+      - Forward strand (+): beg=start_codon, end=stop_codon
+      - Reverse strand (-): beg=stop_codon, end=start_codon
+    
+    So the actual stop position is:
+      - Forward strand: end position
+      - Reverse strand: beg position (the lower coordinate)
+    
     Args:
         inference_csv: CSV with ORF_ID and Real_probability from DNABERT inference
         scores_file: Original Prodigal scores file (to get start scores)
@@ -181,8 +189,8 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
         if match:
             return {
                 'contig': match.group(1),
-                'start': int(match.group(2)),
-                'end': int(match.group(3)),
+                'beg': int(match.group(2)),      # Lower coordinate
+                'end': int(match.group(3)),      # Higher coordinate
                 'strand': match.group(4)
             }
         return None
@@ -198,11 +206,28 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
         return df
     
     df['contig'] = df['parsed'].apply(lambda x: x['contig'])
-    df['start'] = df['parsed'].apply(lambda x: x['start'])
+    df['beg'] = df['parsed'].apply(lambda x: x['beg'])
     df['end'] = df['parsed'].apply(lambda x: x['end'])
     df['strand'] = df['parsed'].apply(lambda x: x['strand'])
     
+    # Calculate actual stop position based on strand
+    # Forward strand (+): stop is at 'end' (higher coordinate)
+    # Reverse strand (-): stop is at 'beg' (lower coordinate)
+    df['stop_pos'] = df.apply(
+        lambda row: row['end'] if row['strand'] == '+' else row['beg'], 
+        axis=1
+    )
+    
+    # Calculate actual start position based on strand
+    # Forward strand (+): start is at 'beg' (lower coordinate)
+    # Reverse strand (-): start is at 'end' (higher coordinate)
+    df['start_pos'] = df.apply(
+        lambda row: row['beg'] if row['strand'] == '+' else row['end'], 
+        axis=1
+    )
+    
     # Load start scores from Prodigal scores file
+    # Key by (contig, beg) since 'beg' is always the first coordinate in the scores file
     start_scores = {}
     current_contig = None
     
@@ -228,7 +253,7 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
     
     # Add start scores to dataframe
     df['start_score'] = df.apply(
-        lambda row: start_scores.get((row['contig'], row['start']), 0.0), 
+        lambda row: start_scores.get((row['contig'], row['beg']), 0.0), 
         axis=1
     )
     
@@ -245,8 +270,11 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
     df['combined_score'] = (weight_start * df['start_score_norm'] + 
                             weight_inference * df['inference_score_norm'])
     
-    # Group by (contig, end, strand) - this is the "stop codon" grouping key
-    df['stop_key'] = df.apply(lambda row: (row['contig'], row['end'], row['strand']), axis=1)
+    # Group by (contig, stop_pos, strand) - this correctly identifies shared stop codons
+    df['stop_key'] = df.apply(
+        lambda row: (row['contig'], row['stop_pos'], row['strand']), 
+        axis=1
+    )
     
     # Count alternatives per stop
     stop_counts = df.groupby('stop_key').size()
@@ -257,7 +285,8 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
     
     # Save results with additional columns for transparency
     output_df = best_orfs[['ORF_ID', 'Real_probability', 'start_score', 
-                           'combined_score', 'num_alternatives']].copy()
+                           'combined_score', 'num_alternatives', 
+                           'start_pos', 'stop_pos']].copy()
     output_df.to_csv(output_csv, index=False)
     
     # Summary statistics
@@ -270,5 +299,17 @@ def deduplicate_by_stop(inference_csv, scores_file, output_csv,
     print(f"  Removed duplicates: {num_duplicates}")
     print(f"  Stops with multiple starts: {num_with_alternatives}")
     print(f"  Results saved to {output_csv}")
+    
+    # Show example of deduplicated group if any exist
+    if num_with_alternatives > 0:
+        example = df[df['stop_key'] == best_orfs[best_orfs['num_alternatives'] > 1].iloc[0]['stop_key']]
+        print(f"\nExample of deduplication:")
+        print(f"  Stop position: {example.iloc[0]['stop_pos']} on strand {example.iloc[0]['strand']}")
+        print(f"  Number of alternative starts: {len(example)}")
+        for _, row in example.iterrows():
+            print(f"    Start {row['start_pos']}: score={row['start_score']:.3f}, "
+                  f"inference={row['Real_probability']:.3f}, "
+                  f"combined={row['combined_score']:.3f} "
+                  f"{'← SELECTED' if row['ORF_ID'] == best_orfs[best_orfs['stop_key'] == row['stop_key']].iloc[0]['ORF_ID'] else ''}")
     
     return best_orfs
