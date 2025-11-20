@@ -1,150 +1,274 @@
 #!/usr/bin/env python3
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from Bio import SeqIO
+import re
 import csv
+import pandas as pd
 from pathlib import Path
-import sys
-import subprocess
 
-# import utilities
-from utils import extract_strong_starts, deduplicate_by_stop
 
-# -----------------------------
-# Prodigal wrapper
-# -----------------------------
-def run_prodigal(fasta_file, output_prefix, mode="meta"):
-    output_prefix = Path(output_prefix)
-    ffn_out = output_prefix.with_suffix(".ffn")
-    faa_out = output_prefix.with_suffix(".faa")
-    scores_out = output_prefix.with_suffix(".scores")
+def extract_strong_starts(scores_file, genome_fasta, threshold=0.0, length=150,
+                          output_fasta=None, faa_file=None):
+    """
+    Extract strong start sequences from a Prodigal .scores file, ignoring 'Edge' genes.
+    Also skip any starts that Prodigal already predicted (from .faa file).
 
-    cmd = [
-        "prodigal",
-        "-i", str(fasta_file),
-        "-d", str(ffn_out),
-        "-a", str(faa_out),
-        "-s", str(scores_out),
-        "-p", mode,
-        "-q"
-    ]
-    print(f"Running Prodigal: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    print(f"Prodigal complete. Outputs: {ffn_out}, {faa_out}, {scores_out}")
-    return ffn_out, faa_out, scores_out
+    Filtering logic:
+      - Parse all ORFs from the .faa file and collect (start,end,strand) per contig.
+      - When scanning the .scores candidates, skip any candidate whose 'Beg' lies
+        within any predicted ORF interval on the same contig (inclusive).
+    """
 
-# -----------------------------
-# DNABERT inference
-# -----------------------------
-def run_dnabert_inference(ffn_file, output_file, device="cuda"):
-    model_dir = Path("model/")  # expects model/ folder with HF model files
+    # Load all contigs (seq records keyed by contig id)
+    contigs = {record.id.split()[0]: record.seq for record in SeqIO.parse(genome_fasta, "fasta")}
 
-    print(f"Loading model from {model_dir} ...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_dir,
-        trust_remote_code=True
+    # Parse prodigal .faa to collect predicted ORFs per contig
+    predicted_orfs = {}  # contig -> list of (start, end, strand_int)
+    if faa_file and Path(faa_file).exists():
+        for record in SeqIO.parse(faa_file, "fasta"):
+            desc = record.description
+
+            # Try a robust regex to capture "# <start> # <end> # <strand> #"
+            m = re.search(r'#\s*(\d+)\s*#\s*(\d+)\s*#\s*([+-]?\d+)\s*#', desc)
+            if m:
+                start = int(m.group(1))
+                end = int(m.group(2))
+                # strand in .faa is often "-1" or "1"
+                try:
+                    strand_int = int(m.group(3))
+                    if strand_int not in (-1, 1):
+                        strand_int = 1 if strand_int > 0 else -1
+                except ValueError:
+                    strand_int = 1
+            else:
+                # fallback to splitting on "#"
+                parts = desc.split("#")
+                if len(parts) >= 4:
+                    try:
+                        start = int(parts[1].strip())
+                        end = int(parts[2].strip())
+                        strand_field = parts[3].strip()
+                        try:
+                            strand_int = int(strand_field)
+                            if strand_int not in (-1, 1):
+                                strand_int = 1 if strand_int > 0 else -1
+                        except ValueError:
+                            # e.g. '+' or '-'
+                            strand_int = 1 if strand_field.startswith("+") else -1
+                    except Exception:
+                        continue
+                else:
+                    continue
+
+            # record.id is the protein id like "k119_73647_1" -> derive contig base "k119_73647"
+            prot_id = record.id.split()[0]
+            m2 = re.match(r'^(.+?)_(\d+)$', prot_id)
+            contig_base = m2.group(1) if m2 else prot_id
+
+            predicted_orfs.setdefault(contig_base, []).append((start, end, strand_int))
+
+    # Counters / results
+    strong_starts = []
+    filtered_by_prodigal = 0
+    current_contig = None
+
+    # Read scores file and extract candidates
+    with open(scores_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("# Sequence Data:"):
+                m = re.search('seqhdr="([^"]+)"', line)
+                if m:
+                    # seqhdr may contain additional info after a space; take first token
+                    current_contig = m.group(1).split()[0]
+                    if current_contig not in contigs:
+                        raise ValueError(f"Contig {current_contig} not found in genome FASTA")
+                continue
+            if line.startswith("#"):
+                continue
+
+            cols = line.split()
+            if len(cols) < 7 or current_contig is None:
+                continue
+
+            try:
+                beg = int(cols[0])
+                end = int(cols[1])
+                strand_field = cols[2]
+                strt_score = float(cols[5])
+                codon = cols[6]
+            except ValueError:
+                continue
+
+            # Skip edge cases
+            if codon == "Edge":
+                continue
+
+            # convert strand to integer oriented like Prodigal: '+' -> 1, '-' -> -1
+            if strand_field == "+":
+                candidate_strand = 1
+            elif strand_field == "-":
+                candidate_strand = -1
+            else:
+                # sometimes it's numeric (e.g. "1" or "-1")
+                try:
+                    candidate_strand = int(strand_field)
+                except ValueError:
+                    candidate_strand = 1
+
+            # If this contig has predicted ORFs, skip if the candidate 'beg' lies within any ORF
+            skip = False
+            for (ps, pe, pstrand) in predicted_orfs.get(current_contig, []):
+                # match same strand OR ignore strand? currently require same strand
+                if candidate_strand == pstrand and (ps <= beg <= pe):
+                    skip = True
+                    break
+            if skip:
+                filtered_by_prodigal += 1
+                continue
+
+            if strt_score >= threshold:
+                seq_obj = contigs[current_contig]
+                if candidate_strand == 1:
+                    start_idx = max(0, beg - 1)
+                    end_idx = start_idx + length
+                    seq = seq_obj[start_idx:end_idx]
+                else:
+                    # negative strand: take window ending at 'end'
+                    end_idx = min(len(seq_obj), end)
+                    start_idx = max(0, end_idx - length)
+                    seq = seq_obj[start_idx:end_idx].reverse_complement()
+                strong_starts.append((f"{current_contig}_start_{beg}_{end}_{'+' if candidate_strand==1 else '-'}", str(seq)))
+
+    if output_fasta:
+        with open(output_fasta, "w") as out:
+            for header, seq in strong_starts:
+                out.write(f">{header}\n{seq}\n")
+        print(f"Extracted {len(strong_starts)} strong start sequences to {output_fasta} "
+              f"(skipped {filtered_by_prodigal} candidates because Prodigal already predicted an ORF here)")
+
+    return strong_starts
+
+
+def deduplicate_by_stop(inference_csv, scores_file, output_csv, 
+                        weight_start=0.5, weight_inference=0.5):
+    """
+    Group ORFs by stop codon and keep the best one based on combined scoring.
+    
+    This handles the case where multiple alternative start codons lead to the same
+    stop codon. We want to pick the best one based on both the Prodigal start score
+    and the DNABERT inference score.
+    
+    Args:
+        inference_csv: CSV with ORF_ID and Real_probability from DNABERT inference
+        scores_file: Original Prodigal scores file (to get start scores)
+        output_csv: Path for deduplicated output CSV
+        weight_start: Weight for start score in combined metric (0-1)
+        weight_inference: Weight for inference score in combined metric (0-1)
+    
+    Returns:
+        DataFrame with deduplicated results
+    """
+    
+    # Load inference results
+    df = pd.read_csv(inference_csv)
+    
+    # Parse ORF_ID to extract contig, start, end, strand
+    # Expected format: "contig_start_100_500_+" or "contig_start_100_500_-"
+    def parse_orf_id(orf_id):
+        match = re.match(r'(.+)_start_(\d+)_(\d+)_([+-])$', orf_id)
+        if match:
+            return {
+                'contig': match.group(1),
+                'start': int(match.group(2)),
+                'end': int(match.group(3)),
+                'strand': match.group(4)
+            }
+        return None
+    
+    df['parsed'] = df['ORF_ID'].apply(parse_orf_id)
+    df = df[df['parsed'].notna()].copy()
+    
+    if len(df) == 0:
+        print("Warning: No valid ORF IDs found in inference CSV")
+        # Create empty output file
+        pd.DataFrame(columns=['ORF_ID', 'Real_probability', 'start_score', 
+                              'combined_score', 'num_alternatives']).to_csv(output_csv, index=False)
+        return df
+    
+    df['contig'] = df['parsed'].apply(lambda x: x['contig'])
+    df['start'] = df['parsed'].apply(lambda x: x['start'])
+    df['end'] = df['parsed'].apply(lambda x: x['end'])
+    df['strand'] = df['parsed'].apply(lambda x: x['strand'])
+    
+    # Load start scores from Prodigal scores file
+    start_scores = {}
+    current_contig = None
+    
+    with open(scores_file) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("# Sequence Data:"):
+                m = re.search('seqhdr="([^"]+)"', line)
+                if m:
+                    current_contig = m.group(1).split()[0]
+                continue
+            if line.startswith("#") or not line:
+                continue
+            
+            cols = line.split()
+            if len(cols) >= 6 and current_contig:
+                try:
+                    beg = int(cols[0])
+                    strt_score = float(cols[5])
+                    start_scores[(current_contig, beg)] = strt_score
+                except (ValueError, IndexError):
+                    continue
+    
+    # Add start scores to dataframe
+    df['start_score'] = df.apply(
+        lambda row: start_scores.get((row['contig'], row['start']), 0.0), 
+        axis=1
     )
-
-    # Force PyTorch attention (disable FlashAttention/Triton)
-    if hasattr(model.config, "use_flash_attn"):
-        model.config.use_flash_attn = False
-    for module in model.modules():
-        if hasattr(module, "flash_attn_forward"):
-            module.flash_attn_forward = None
-
-    model.to(device)
-    model.eval()
-
-    # read sequences from FASTA
-    from Bio import SeqIO
-    fragments = [(record.id, str(record.seq)) for record in SeqIO.parse(ffn_file, "fasta")]
-
-    results = []
-    print(f"Running inference on {len(fragments)} sequences ...")
-    with torch.no_grad():
-        for header, seq in fragments:
-            inputs = tokenizer(seq, return_tensors="pt", padding=True, truncation=True).to(device)
-            logits = model(**inputs).logits
-            prob = torch.softmax(logits, dim=1)[0, 1].item()
-            results.append((header, prob))
-
-    # save results
-    with open(output_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["ORF_ID", "Real_probability"])
-        writer.writerows(results)
-
-    print(f"Inference complete. Results saved to {output_file}")
-
-# -----------------------------
-# Main CLI
-# -----------------------------
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python main.py prodigal <input.fasta> <output_prefix> [meta|single]")
-        print("  python main.py extract <scores_file> <genome.fasta> <output.fasta> [threshold] [length]")
-        print("  python main.py inference <input.fasta> <output.csv> [device]")
-        print("  python main.py deduplicate <inference.csv> <scores_file> <output.csv> [weight_start] [weight_inference]")
-        sys.exit(1)
-
-    mode = sys.argv[1]
-
-    if mode == "prodigal":
-        if len(sys.argv) < 4:
-            print("Usage: python main.py prodigal <input.fasta> <output_prefix> [meta|single]")
-            sys.exit(1)
-        fasta_file = sys.argv[2]
-        output_prefix = sys.argv[3]
-        prod_mode = sys.argv[4] if len(sys.argv) > 4 else "meta"
-        run_prodigal(fasta_file, output_prefix, prod_mode)
-
-    elif mode == "extract":
-        if len(sys.argv) < 5:
-            print("Usage: python main.py extract <scores_file> <genome.fasta> <output.fasta> [threshold] [length]")
-            sys.exit(1)
-        scores_file = sys.argv[2]
-        genome_fasta = sys.argv[3]
-        output_file = sys.argv[4]
-        threshold = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
-        length = int(sys.argv[6]) if len(sys.argv) > 6 else 150
-        # automatically pick up corresponding .faa file from scores_file prefix
-        faa_file = Path(scores_file).with_suffix(".faa")
-        extract_strong_starts(scores_file, genome_fasta, threshold, length, output_file, faa_file=faa_file)
-
-    elif mode == "inference":
-        if len(sys.argv) < 4:
-            print("Usage: python main.py inference <input.fasta> <output.csv> [device]")
-            sys.exit(1)
-        ffn_file = sys.argv[2]
-        output_file = sys.argv[3]
-        device = sys.argv[4] if len(sys.argv) > 4 else "cuda"
-        run_dnabert_inference(ffn_file, output_file, device)
-
-    elif mode == "deduplicate":
-        if len(sys.argv) < 5:
-            print("Usage: python main.py deduplicate <inference.csv> <scores_file> <output.csv> [weight_start] [weight_inference]")
-            print("\nDeduplicates ORFs that share the same stop codon, keeping the best")
-            print("candidate based on a weighted combination of start score and inference score.")
-            print("\nDefaults: weight_start=0.5, weight_inference=0.5")
-            print("Example: python main.py deduplicate results.csv genome.scores dedup.csv 0.3 0.7")
-            sys.exit(1)
-        inference_csv = sys.argv[2]
-        scores_file = sys.argv[3]
-        output_csv = sys.argv[4]
-        weight_start = float(sys.argv[5]) if len(sys.argv) > 5 else 0.5
-        weight_inference = float(sys.argv[6]) if len(sys.argv) > 6 else 0.5
-        
-        # Validate weights
-        if weight_start < 0 or weight_start > 1 or weight_inference < 0 or weight_inference > 1:
-            print("Error: Weights must be between 0 and 1")
-            sys.exit(1)
-        if abs(weight_start + weight_inference - 1.0) > 0.01:
-            print("Warning: Weights do not sum to 1.0, but proceeding anyway...")
-        
-        deduplicate_by_stop(inference_csv, scores_file, output_csv, weight_start, weight_inference)
-
+    
+    # Normalize scores to 0-1 range
+    if df['start_score'].max() > df['start_score'].min():
+        df['start_score_norm'] = ((df['start_score'] - df['start_score'].min()) / 
+                                  (df['start_score'].max() - df['start_score'].min()))
     else:
-        print(f"Unknown mode: {mode}")
-        print("\nAvailable modes: prodigal, extract, inference, deduplicate")
-        sys.exit(1)
+        df['start_score_norm'] = 1.0
+    
+    df['inference_score_norm'] = df['Real_probability']  # Already 0-1
+    
+    # Combined score
+    df['combined_score'] = (weight_start * df['start_score_norm'] + 
+                            weight_inference * df['inference_score_norm'])
+    
+    # Group by (contig, end, strand) - this is the "stop codon" grouping key
+    df['stop_key'] = df.apply(lambda row: (row['contig'], row['end'], row['strand']), axis=1)
+    
+    # Count alternatives per stop
+    stop_counts = df.groupby('stop_key').size()
+    df['num_alternatives'] = df['stop_key'].map(stop_counts)
+    
+    # Keep the row with highest combined score per stop position
+    best_orfs = df.loc[df.groupby('stop_key')['combined_score'].idxmax()].copy()
+    
+    # Save results with additional columns for transparency
+    output_df = best_orfs[['ORF_ID', 'Real_probability', 'start_score', 
+                           'combined_score', 'num_alternatives']].copy()
+    output_df.to_csv(output_csv, index=False)
+    
+    # Summary statistics
+    num_duplicates = len(df) - len(best_orfs)
+    num_with_alternatives = (best_orfs['num_alternatives'] > 1).sum()
+    
+    print(f"\nDeduplication complete:")
+    print(f"  Input candidates: {len(df)}")
+    print(f"  Unique stop codons: {len(best_orfs)}")
+    print(f"  Removed duplicates: {num_duplicates}")
+    print(f"  Stops with multiple starts: {num_with_alternatives}")
+    print(f"  Results saved to {output_csv}")
+    
+    return best_orfs
